@@ -20,7 +20,7 @@ def get_hand_data():
     return jsonify(shared_hand_data)
 
 def start_flask_server():
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=2501)
 
 # === MediaPipe Setup ===
 mp_hands = mp.solutions.hands
