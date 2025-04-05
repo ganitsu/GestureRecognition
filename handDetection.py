@@ -4,11 +4,25 @@ import time
 import cv2
 import numpy as np
 import mediapipe as mp
+import threading
+from flask import Flask, jsonify
 
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from mediapipe.framework.formats import landmark_pb2
 
+# === Flask App Setup ===
+app = Flask(__name__)
+shared_hand_data = []
+
+@app.route('/hands', methods=['GET'])
+def get_hand_data():
+    return jsonify(shared_hand_data)
+
+def start_flask_server():
+    app.run(host="0.0.0.0", port=5000)
+
+# === MediaPipe Setup ===
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
@@ -23,6 +37,8 @@ def run(model: str, num_hands: int,
         proc_width: int, proc_height: int,
         processing_fps: float, disable_image: bool, silence: bool) -> None:
 
+    global shared_hand_data
+
     cap = None
     if not disable_image:
         cap = cv2.VideoCapture(stream_url)
@@ -32,31 +48,42 @@ def run(model: str, num_hands: int,
         if not cap.isOpened():
             sys.exit(f'ERROR: Unable to open video stream from {stream_url}')
 
-    row_size = 50
-    left_margin = 24
-    text_color = (0, 0, 0)
-    font_size = 1
-    font_thickness = 1
     fps_avg_frame_count = 10
-
     last_processed_time = 0
     processing_interval = 1.0 / processing_fps
     last_result = None
 
     def save_result(result, unused_output_image: mp.Image, timestamp_ms: int):
         nonlocal last_result
-        global FPS, COUNTER, START_TIME
+        global FPS, COUNTER, START_TIME, shared_hand_data
         if COUNTER % fps_avg_frame_count == 0:
             FPS = fps_avg_frame_count / (time.time() - START_TIME)
             START_TIME = time.time()
         last_result = result
         COUNTER += 1
-        if disable_image and result.gestures:
+
+        output = []
+        for i, landmarks in enumerate(result.hand_landmarks):
+            x_center = np.mean([lmk.x for lmk in landmarks])
+            y_center = np.mean([lmk.y for lmk in landmarks])
+            gesture_name = result.gestures[i][0].category_name if result.gestures else None
+            gesture_score = result.gestures[i][0].score if result.gestures else None
+
+            hand_data = {
+                "id": i,
+                "gesture": gesture_name,
+                "score": round(gesture_score, 2) if gesture_score is not None else None,
+                "center": {"x": round(x_center, 3), "y": round(y_center, 3)}
+            }
+            output.append(hand_data)
+
+        shared_hand_data = output
+
+        if disable_image and result.gestures and not silence:
             for gesture in result.gestures:
                 label = gesture[0].category_name
                 score = gesture[0].score
-                if not silence:
-                    print(f"[HAND] Detected: {label} ({score:.2f})")
+                print(f"[HAND] Detected: {label} ({score:.2f})")
 
     base_options = python.BaseOptions(model_asset_path=model)
     options = vision.GestureRecognizerOptions(
@@ -74,7 +101,7 @@ def run(model: str, num_hands: int,
         current_time = time.time()
         if current_time - last_processed_time >= processing_interval:
             last_processed_time = current_time
-            if not silence: 
+            if not silence:
                 print("[INFO] Processing frame...")
 
             if disable_image:
@@ -98,47 +125,33 @@ def run(model: str, num_hands: int,
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
             recognizer.recognize_async(mp_image, time.time_ns() // 1_000_000)
 
-        if not disable_image:
+        if not disable_image and last_result:
             success, image = cap.read()
             if not success:
                 print('WARNING: Unable to read from stream.')
                 break
 
             image = cv2.flip(image, 1)
+            for hand_index, hand_landmarks in enumerate(last_result.hand_landmarks):
+                hand_landmarks_proto = landmark_pb2.NormalizedLandmarkList()
+                hand_landmarks_proto.landmark.extend([
+                    landmark_pb2.NormalizedLandmark(x=lmk.x, y=lmk.y, z=lmk.z) for lmk in hand_landmarks
+                ])
+                mp_drawing.draw_landmarks(image, hand_landmarks_proto, mp_hands.HAND_CONNECTIONS,
+                                          mp_drawing_styles.get_default_hand_landmarks_style(),
+                                          mp_drawing_styles.get_default_hand_connections_style())
 
-            fps_text = 'FPS = {:.1f}'.format(FPS)
-            text_location = (left_margin, row_size)
-            cv2.putText(image, fps_text, text_location, cv2.FONT_HERSHEY_DUPLEX, font_size, text_color, font_thickness, cv2.LINE_AA)
+                if last_result.gestures:
+                    gesture = last_result.gestures[hand_index]
+                    label = gesture[0].category_name
+                    score = round(gesture[0].score, 2)
+                    center_x = int(np.mean([lmk.x for lmk in hand_landmarks]) * image.shape[1])
+                    center_y = int(np.mean([lmk.y for lmk in hand_landmarks]) * image.shape[0])
+                    text = f'{label} ({score})'
+                    cv2.putText(image, text, (center_x, center_y - 20), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
-            if last_result:
-                for hand_index, hand_landmarks in enumerate(last_result.hand_landmarks):
-                    x_min = min([landmark.x for landmark in hand_landmarks])
-                    y_min = min([landmark.y for landmark in hand_landmarks])
-                    y_max = max([landmark.y for landmark in hand_landmarks])
-                    frame_height_disp, frame_width_disp = image.shape[:2]
-                    x_min_px = int(x_min * frame_width_disp)
-                    y_min_px = int(y_min * frame_height_disp)
-                    y_max_px = int(y_max * frame_height_disp)
-
-                    if last_result.gestures:
-                        gesture = last_result.gestures[hand_index]
-                        category_name = gesture[0].category_name
-                        score = round(gesture[0].score, 2)
-                        result_text = f'{category_name} ({score})'
-                        text_x, text_y = x_min_px, y_min_px - 10
-                        if text_y < 0:
-                            text_y = y_max_px + 20
-                        cv2.putText(image, result_text, (text_x, text_y), cv2.FONT_HERSHEY_DUPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
-
-                    hand_landmarks_proto = landmark_pb2.NormalizedLandmarkList()
-                    hand_landmarks_proto.landmark.extend([
-                        landmark_pb2.NormalizedLandmark(x=landmark.x, y=landmark.y, z=landmark.z) for landmark in hand_landmarks
-                    ])
-                    mp_drawing.draw_landmarks(image, hand_landmarks_proto, mp_hands.HAND_CONNECTIONS,
-                                              mp_drawing_styles.get_default_hand_landmarks_style(),
-                                              mp_drawing_styles.get_default_hand_connections_style())
-
-            cv2.imshow('gesture_recognition', image)
+            cv2.imshow("Gesture Recognition", image)
             if cv2.waitKey(1) == 27:
                 break
         else:
@@ -160,12 +173,15 @@ def main():
     parser.add_argument('--streamUrl', default="http://nitsuga:putoelquelee@192.168.0.127:30141/videostream.cgi")
     parser.add_argument('--frameWidth', type=int, default=128)
     parser.add_argument('--frameHeight', type=int, default=128)
-    parser.add_argument('--procWidth', type=int, default=128)
-    parser.add_argument('--procHeight', type=int, default=128)
+    parser.add_argument('--procWidth', type=int, default=64)
+    parser.add_argument('--procHeight', type=int, default=64)
     parser.add_argument('--processingFps', type=float, default=1.0)
     parser.add_argument('--disableImage', action='store_true', help='Disable image display and capture')
-    parser.add_argument('--silence', action='store_true', help='Disable image display and capture')
+    parser.add_argument('--silence', action='store_true', help='Suppress output logs')
     args = parser.parse_args()
+
+    flask_thread = threading.Thread(target=start_flask_server, daemon=True)
+    flask_thread.start()
 
     run(args.model, args.numHands, args.minHandDetectionConfidence, args.minHandPresenceConfidence,
         args.minTrackingConfidence, args.streamUrl, args.frameWidth, args.frameHeight,
