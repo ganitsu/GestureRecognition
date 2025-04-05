@@ -1,8 +1,8 @@
-# Importaciones igual que antes
 import argparse
 import sys
 import time
 import cv2
+import numpy as np
 import mediapipe as mp
 
 from mediapipe.tasks import python
@@ -21,7 +21,7 @@ def run(model: str, num_hands: int,
         min_hand_presence_confidence: float, min_tracking_confidence: float,
         stream_url: str, frame_width: int, frame_height: int,
         proc_width: int, proc_height: int,
-        processing_fps: float, disable_image: bool) -> None:
+        processing_fps: float, disable_image: bool, silence: bool) -> None:
 
     cap = None
     if not disable_image:
@@ -51,6 +51,12 @@ def run(model: str, num_hands: int,
             START_TIME = time.time()
         last_result = result
         COUNTER += 1
+        if disable_image and result.gestures:
+            for gesture in result.gestures:
+                label = gesture[0].category_name
+                score = gesture[0].score
+                if not silence:
+                    print(f"[HAND] Detected: {label} ({score:.2f})")
 
     base_options = python.BaseOptions(model_asset_path=model)
     options = vision.GestureRecognizerOptions(
@@ -68,20 +74,27 @@ def run(model: str, num_hands: int,
         current_time = time.time()
         if current_time - last_processed_time >= processing_interval:
             last_processed_time = current_time
+            if not silence: 
+                print("[INFO] Processing frame...")
 
-            if not disable_image:
+            if disable_image:
+                temp_cap = cv2.VideoCapture(stream_url)
+                temp_cap.set(cv2.CAP_PROP_FRAME_WIDTH, frame_width)
+                temp_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, frame_height)
+                success, image = temp_cap.read()
+                temp_cap.release()
+                if not success:
+                    print('WARNING: Unable to read from stream.')
+                    continue
+            else:
                 success, image = cap.read()
                 if not success:
                     print('WARNING: Unable to read from stream.')
                     break
 
-                image = cv2.flip(image, 1)
-                resized_image = cv2.resize(image, (proc_width, proc_height))
-                rgb_image = cv2.cvtColor(resized_image, cv2.COLOR_BGR2RGB)
-            else:
-                # Create a blank image just to trigger processing
-                rgb_image = (255 * np.ones((proc_height, proc_width, 3), dtype=np.uint8))
-
+            image = cv2.flip(image, 1)
+            resized_image = cv2.resize(image, (proc_width, proc_height))
+            rgb_image = cv2.cvtColor(resized_image, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
             recognizer.recognize_async(mp_image, time.time_ns() // 1_000_000)
 
@@ -151,11 +164,12 @@ def main():
     parser.add_argument('--procHeight', type=int, default=128)
     parser.add_argument('--processingFps', type=float, default=1.0)
     parser.add_argument('--disableImage', action='store_true', help='Disable image display and capture')
+    parser.add_argument('--silence', action='store_true', help='Disable image display and capture')
     args = parser.parse_args()
 
     run(args.model, args.numHands, args.minHandDetectionConfidence, args.minHandPresenceConfidence,
         args.minTrackingConfidence, args.streamUrl, args.frameWidth, args.frameHeight,
-        args.procWidth, args.procHeight, args.processingFps, args.disableImage)
+        args.procWidth, args.procHeight, args.processingFps, args.disableImage, args.silence)
 
 if __name__ == '__main__':
     main()
